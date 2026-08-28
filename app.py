@@ -3,6 +3,7 @@ import pandas as pd
 import textwrap
 from pathlib import Path
 import math
+import json
 
 # ============================================================
 # CONFIG
@@ -17,6 +18,20 @@ st.set_page_config(
 
 st.markdown("""
 <style>
+/* ปุ่มบันทึกสีเขียวอ่อน */
+.stButton > button[kind="primary"] {
+    background: #DDF3D5 !important;
+    color: #263238 !important;
+    border: 1px solid #B8D9B0 !important;
+    box-shadow: none !important;
+}
+
+.stButton > button[kind="primary"]:hover {
+    background: #D2EDC8 !important;
+    color: #263238 !important;
+    border-color: #9FCB94 !important;
+}
+
 /* XD selected chips: override Streamlit/BaseWeb primary color */
 [data-testid="stMultiSelect"] [data-baseweb="tag"] {
     background-color: #dff2d8 !important;
@@ -28,6 +43,44 @@ st.markdown("""
 
 EXCEL_FILE = Path(__file__).parent / "Project.xlsx"
 
+# ============================================================
+# บันทึก/โหลดการจัดกำลังคนแยกตามวันที่
+# ============================================================
+SAVE_FILE = Path(__file__).parent / "manpower_saved_data.json"
+
+def read_saved_data():
+    if not SAVE_FILE.exists():
+        return {}
+    try:
+        with SAVE_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+def write_saved_data(data):
+    temp_file = SAVE_FILE.with_suffix(".tmp")
+    with temp_file.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    temp_file.replace(SAVE_FILE)
+
+saved_data = read_saved_data()
+
+def saved_day_key(value):
+    return pd.Timestamp(value).date().isoformat()
+
+def get_saved_day(date_value):
+    return saved_data.get(saved_day_key(date_value), {})
+
+def load_saved_for_selected_date():
+    date_value = st.session_state.get("dashboard_date_picker", default_date)
+    saved = get_saved_day(date_value)
+
+    # callback ทำงานก่อน widget รอบใหม่ถูกสร้าง จึงแก้ workload_text ได้
+    st.session_state["order_qty"] = int(saved.get("workload", 0))
+    st.session_state["workload_text"] = f'{int(saved.get("workload", 0)):,}'
+
+
 SHIFT_INFO = {
     "A100": {"name": "01.00", "bg": "#DDF3D5", "accent": "#7ED957"},
     "A600": {"name": "06.00", "bg": "#FFF1B8", "accent": "#FFD54F"},
@@ -35,6 +88,40 @@ SHIFT_INFO = {
 }
 SHIFT_CODES = list(SHIFT_INFO.keys())
 WORKING_CODES = set(SHIFT_CODES)
+
+# ============================================================
+# แปลงรหัสกะจาก Excel รุ่นใหม่ให้เป็นรหัสมาตรฐานของระบบ
+# B100 / X100 -> A100
+# B600 / X600 -> A600
+# B900 / X900 -> A900
+# B400 / X400 -> A400
+# B300 / X300 -> A300
+# B200 / X200 -> A200
+# B / X -> H
+# ============================================================
+CODE_ALIASES = {
+    "B100": "A100", "X100": "A100",
+    "B600": "A600", "X600": "A600",
+    "B900": "A900", "X900": "A900",
+    "B400": "A400", "X400": "A400",
+    "B300": "A300", "X300": "A300",
+    "B200": "A200", "X200": "A200",
+    "B": "H", "X": "H",
+}
+
+SHIFT_DISPLAY = {
+    "A100": "01.00",
+    "A200": "02.00",
+    "A300": "03.00",
+    "A400": "04.00",
+    "A600": "06.00",
+    "A900": "09.00",
+}
+
+def normalize_work_code(value):
+    """แปลงรหัส Excel รุ่นใหม่เป็นรหัสมาตรฐานที่ระบบใช้"""
+    value = str(value).strip().upper()
+    return CODE_ALIASES.get(value, value)
 LEADER_ROLES = {"หัวหน้าหน่วย", "ผู้ช่วยหัวหน้าหน่วย"}
 
 SPECIAL_NAMES = ["เรียกรถ", "ควบคุมงาน", "ไล่ของ", "แยกเสื่อม", "ดูแลหน้างาน"]
@@ -237,6 +324,12 @@ with workload_area:
             unsafe_allow_html=True,
         )
 
+    if "workload_initialized" not in st.session_state:
+        initial_saved = get_saved_day(default_date)
+        st.session_state["order_qty"] = int(initial_saved.get("workload", 0))
+        st.session_state["workload_text"] = f'{int(initial_saved.get("workload", 0)):,}'
+        st.session_state["workload_initialized"] = True
+
     current_qty = int(st.session_state.get("order_qty", 0))
 
     with workload_value_col:
@@ -266,6 +359,7 @@ with date_area:
         format="DD/MM/YYYY",
         label_visibility="collapsed",
         key="dashboard_date_picker",
+        on_change=load_saved_for_selected_date,
     )
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -314,7 +408,7 @@ working = operational_employees[
     operational_employees[date_col].astype(str).str.strip().isin(WORKING_CODES)
 ].copy()
 
-working["shift_code"] = working[date_col].astype(str).str.strip()
+working["shift_code"] = working[date_col].apply(normalize_work_code)
 working["person_id"] = (
     working[1].astype(str).str.replace(".0", "", regex=False).str.strip()
 )
@@ -340,8 +434,8 @@ shift_counts = {
     for code in SHIFT_CODES
 }
 
-all_day_values = operational_employees[date_col].astype(str).str.strip()
-h_count = int(all_day_values.isin({"H", "H400"}).sum())
+all_day_values = operational_employees[date_col].apply(normalize_work_code)
+h_count = int(all_day_values.apply(normalize_work_code).eq("H").sum())
 vacation_count = int(all_day_values.isin({"พ", "พักร้อน"}).sum())
 day_count = int(all_day_values.isin({"ว", "วัน"}).sum())
 
@@ -567,13 +661,12 @@ st.markdown("""
 .date-dashboard-card {
     width: 100%;
     box-sizing: border-box;
-    background: transparent !important;
-    border: 0 !important;
-    border-radius: 0;
-    padding: 0 !important;
+    background: #ffffff !important;
+    border: 4px solid #ffffff;
+    border-radius: 18px;
+    padding: 8px 14px 8px 14px;
     text-align: center;
     margin: 0 0 10px auto;
-    overflow: hidden !important;
 }
 
 .date-dashboard-title {
@@ -584,15 +677,11 @@ st.markdown("""
     margin-bottom: 6px;
 }
 
-[data-testid="stDateInput"],
-[data-testid="stDateInput"] > div,
-[data-testid="stDateInput"] > div > div {
-    background: transparent !important;
+[data-testid="stDateInput"] > div {
+    background: #ffffff !important;
     border: 0 !important;
     padding: 0 !important;
-    margin: 0 !important;
     box-shadow: none !important;
-    overflow: hidden !important;
 }
 
 [data-testid="stDateInput"] input {
@@ -1511,11 +1600,12 @@ h1, h2, h3, p, span, div, label {
 # ผู้จัดการแผนก
 # ============================================================
 def manager_status(row):
-    value = str(row[date_col]).strip()
+    value = normalize_work_code(row[date_col])
 
     manager_shift_times = {
         "A100": "01.00",
         "A200": "02.00",
+        "A300": "03.00",
         "A400": "04.00",
         "A500": "05.00",
         "A600": "06.00",
@@ -1636,13 +1726,13 @@ pie_svg = (
 
 if working_people >= 39:
     work_class = "stat-work-green"
-    work_text = "กำลังคนเพียงพอ"
+    work_text = "เพียงพอ"
 elif 37 <= working_people <= 38:
     work_class = "stat-work-orange"
-    work_text = "กำลังคนปานกลาง"
+    work_text = "ควรติดตาม"
 else:
     work_class = "stat-work-red"
-    work_text = "กำลังคนน้อยต้องเฝ้าระวัง"
+    work_text = "ต้องเฝ้าระวัง"
 
 # เงื่อนไขสีของจำนวนคนแต่ละกะ
 def shift_status_class(code, count):
@@ -1838,7 +1928,19 @@ def default_assignments():
     return data
 
 if state_key not in st.session_state:
-    st.session_state[state_key] = default_assignments()
+    saved_day = get_saved_day(selected_date)
+    saved_assignments = saved_day.get("assignments")
+
+    if isinstance(saved_assignments, dict):
+        defaults = default_assignments()
+        defaults.update({
+            key: value
+            for key, value in saved_assignments.items()
+            if isinstance(value, list)
+        })
+        st.session_state[state_key] = defaults
+    else:
+        st.session_state[state_key] = default_assignments()
 
 # IMPORTANT: component renders the last source container first in this setup.
 # Put A100 last so visual order is A100, A600, A900, XD1...XD20, specials.
@@ -1873,7 +1975,7 @@ def get_person_month_stats(pid):
         return stats
 
     for col in month_date_cols:
-        value = str(row[col]).strip()
+        value = normalize_work_code(row[col])
 
         if value == "A100":
             stats["01.00"] += 1
@@ -1887,7 +1989,7 @@ def get_person_month_stats(pid):
             stats["ขาด (ข)"] += 1
         elif value == "ป":
             stats["ป่วย (ป)"] += 1
-        elif value in {"H", "H400"}:
+        elif value == "H":
             stats["H"] += 1
 
     return stats
@@ -2196,13 +2298,51 @@ if st.session_state["show_shift_people"]:
                     )
 
     # ========================================================
-    # H วันนี้: ใช้กะของ "เมื่อวาน" เป็นตัวกำหนดสี
+    # หมวด "หยุด"
     # ========================================================
+    # วันนี้ = H -> ใช้กะของเมื่อวานเพื่อกำหนดสี
+    # วันนี้ = ป/ว/ก/พ/ข -> สีเทา + แสดงสถานะของ "วันนี้"
+    status_display_map = {
+        "ป": "ป่วย",
+        "ป่วย": "ป่วย",
+        "ว": "ตรงวัน",
+        "ตรงวัน": "ตรงวัน",
+        "ก": "กิจ",
+        "กิจ": "กิจ",
+        "พ": "พักร้อน",
+        "พักร้อน": "พักร้อน",
+        "ข": "ขาด",
+        "ขาด": "ขาด",
+    }
+
+    def display_stop_status(value):
+        value = str(value).strip()
+        return status_display_map.get(value, value if value else "-")
+
+    today_values = operational_employees[date_col].apply(normalize_work_code)
+
     h_today_ids = operational_employees.loc[
-        operational_employees[date_col].astype(str).str.strip().isin({"H", "H400"}),
-        1
+        today_values.eq("H"), 1
     ].astype(str).str.replace(".0", "", regex=False).str.strip().tolist()
 
+    # สถานะอื่นที่ไม่ใช่กะและไม่ใช่ H
+    status_stop_rows = operational_employees.loc[
+        (~today_values.isin(set(SHIFT_INFO.keys()) | {"H"}))
+        & (today_values.isin(set(status_display_map.keys())))
+    ].copy()
+
+    status_stop_items = []
+    for _, row_data in status_stop_rows.iterrows():
+        pid = str(row_data[1]).replace(".0", "").strip()
+        current_value = normalize_work_code(row_data[date_col])
+
+        status_stop_items.append({
+            "pid": pid,
+            "bg": "#E5E7EB",
+            "subtext": display_stop_status(current_value),
+        })
+
+    # หา "กะเมื่อวาน" สำหรับคนที่วันนี้เป็น H
     yesterday = selected_date - pd.Timedelta(days=1)
     yesterday_col = date_columns.get(yesterday)
 
@@ -2213,50 +2353,42 @@ if st.session_state["show_shift_people"]:
         "GRAY": [],
     }
 
-    if yesterday_col is not None:
-        yesterday_values = employees[yesterday_col].astype(str).str.strip()
+    for pid in h_today_ids:
+        rows = employees[
+            employees[1].astype(str).str.replace(".0", "", regex=False).str.strip() == pid
+        ]
 
-        for pid in h_today_ids:
-            rows = employees[
-                employees[1].astype(str).str.replace(".0", "", regex=False).str.strip() == pid
-            ]
+        previous_shift = ""
+        if not rows.empty and yesterday_col is not None:
+            previous_shift = normalize_work_code(rows.iloc[0][yesterday_col])
 
-            if rows.empty:
-                h_shift_groups["OTHER"].append(pid)
-                continue
+        if previous_shift in SHIFT_INFO:
+            h_shift_groups[previous_shift].append(pid)
+        else:
+            h_shift_groups["GRAY"].append(pid)
 
-            previous_shift = str(rows.iloc[0][yesterday_col]).strip()
-
-            if previous_shift in SHIFT_INFO:
-                h_shift_groups[previous_shift].append(pid)
-            elif previous_shift in {"ป", "ว", "พ"}:
-                # สีเทาใช้เฉพาะคนที่เมื่อวานมีค่า ป / ว / พ
-                h_shift_groups["GRAY"].append((pid, previous_shift))
-    else:
-        h_shift_groups["GRAY"] = []
-
-    total_h_people = len(h_today_ids)
+    total_stop_people = len(h_today_ids) + len(status_stop_items)
 
     st.markdown(
-        f'<div class="shift-panel-title">H — {total_h_people} คน</div>',
+        f'<div class="shift-panel-title">หยุด — {total_stop_people} คน</div>',
         unsafe_allow_html=True,
     )
 
-    # แสดง H ตามสีกะของเมื่อวาน
+    # --- H: ใช้สีกะของเมื่อวาน ---
     for previous_code in ["A100", "A600", "A900", "GRAY"]:
-        h_names = h_shift_groups[previous_code]
-        if not h_names:
+        person_list = h_shift_groups[previous_code]
+        if not person_list:
             continue
 
         if previous_code in SHIFT_INFO:
-            info = SHIFT_INFO[previous_code]
-            bg = info["bg"]
-            previous_label_map = {pid: info["name"] for pid in h_names}
-            person_list = h_names
+            bg = SHIFT_INFO[previous_code]["bg"]
+            subtext_map = {
+                pid: SHIFT_INFO[previous_code]["name"]
+                for pid in person_list
+            }
         else:
             bg = "#E5E7EB"
-            previous_label_map = {pid: status for pid, status in h_names}
-            person_list = [pid for pid, _ in h_names]
+            subtext_map = {pid: "H" for pid in person_list}
 
         for row_start in range(0, len(person_list), 6):
             row_names = person_list[row_start:row_start + 6]
@@ -2264,23 +2396,34 @@ if st.session_state["show_shift_people"]:
 
             for col, pid in zip(cols, row_names):
                 with col:
-                    nickname = display_person(pid)
                     row = all_id_to_row.get(str(pid))
-
                     position = str(row[4]).strip() if row is not None else ""
-
-                    role_badge = (
-                        f'<div class="shift-role-badge">{position}</div>'
-                        if position in LEADER_ROLES
-                        else ""
-                    )
 
                     render_person_card_button(
                         pid,
                         bg,
-                        subtext=previous_label_map[pid],
+                        subtext=subtext_map[pid],
                         role_badge=position if position in LEADER_ROLES else "",
                     )
+
+    # --- ป/ว/ก/พ/ข: แสดงสีเทาและข้อความของวันนี้ ---
+    for row_start in range(0, len(status_stop_items), 6):
+        row_items = status_stop_items[row_start:row_start + 6]
+        cols = st.columns(6, gap="small")
+
+        for col, item in zip(cols, row_items):
+            with col:
+                pid = item["pid"]
+                row = all_id_to_row.get(str(pid))
+                position = str(row[4]).strip() if row is not None else ""
+
+                render_person_card_button(
+                    pid,
+                    item["bg"],
+                    subtext=item["subtext"],
+                    role_badge=position if position in LEADER_ROLES else "",
+                )
+
 
 # ============================================================
 # จัดกำลังคน — XD1-XD20
@@ -2531,6 +2674,26 @@ for col, name in zip(special_cols, SPECIAL_NAMES):
         )
         st.session_state[state_key][key] = selected_ids
 
+if st.button("💾 บันทึก", use_container_width=True, type="primary"):
+    day_key = saved_day_key(selected_date)
+
+    save_payload = {
+        "workload": int(order_qty),
+        "assignments": {
+            key: [str(pid) for pid in values]
+            for key, values in st.session_state[state_key].items()
+            if isinstance(values, list)
+        },
+    }
+
+    saved_data[day_key] = save_payload
+    write_saved_data(saved_data)
+
+    st.success(
+        f"บันทึกข้อมูลวันที่ {selected_date.strftime('%d/%m/%Y')} เรียบร้อยแล้ว "
+        "และสามารถแก้ไขแล้วกดบันทึกทับข้อมูลเดิมได้"
+    )
+
 if st.button("🔄 รีเซ็ตการจัดกำลังคนของวันที่เลือก", use_container_width=True):
     # เปลี่ยน widget version เพื่อบังคับให้ Streamlit สร้างช่องเลือกใหม่
     # จึงล้างค่าที่ค้างอยู่ใน XD1–XD20 และจุดปฏิบัติงานพิเศษได้จริง
@@ -2614,3 +2777,4 @@ st.markdown("""
 }
 </style>
 """, unsafe_allow_html=True)
+
